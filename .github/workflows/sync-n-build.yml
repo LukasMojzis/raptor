@@ -1,0 +1,481 @@
+name: Mirror upstream, build, and release
+
+on:
+  push:
+    branches:
+      - ci
+  schedule:
+    - cron: "*/10 * * * *"
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build even when origin/main already matches upstream/main"
+        required: false
+        default: false
+        type: boolean
+      platform:
+        description: "Platform to build"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - t20
+          - t21
+          - t23
+          - t30
+          - t31
+          - t32
+          - t40
+          - t41
+
+permissions:
+  contents: write
+
+concurrency:
+  group: raptor-main-release
+  cancel-in-progress: false
+
+env:
+  THINGINO_REPOSITORY: https://github.com/themactep/thingino-firmware.git
+  THINGINO_REF: master
+  BR2_DL_DIR: ${{ github.workspace }}/.buildroot-dl
+  FORCE_UNSAFE_CONFIGURE: 1
+  TERM: linux
+  TZ: UTC
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.out.outputs.changed }}
+      full_matrix: ${{ steps.out.outputs.full_matrix }}
+      matrix: ${{ steps.out.outputs.matrix }}
+      release_latest: ${{ steps.out.outputs.release_latest }}
+      should_build: ${{ steps.out.outputs.should_build }}
+      target_sha: ${{ steps.out.outputs.target_sha }}
+
+    steps:
+      - name: Checkout control branch
+        uses: actions/checkout@v4
+        with:
+          ref: ci
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch origin and upstream
+        run: |
+          git remote add upstream https://github.com/gtxaspec/raptor.git || true
+          git fetch origin +refs/heads/main:refs/remotes/origin/main +refs/heads/ci:refs/remotes/origin/ci --prune
+          git fetch upstream +refs/heads/main:refs/remotes/upstream/main --prune
+
+      - name: Decide mirrored commit
+        id: mode
+        env:
+          FORCE_BUILD: ${{ github.event_name == 'push' || github.event.schedule == '0 0 * * *' || inputs.force_build || false }}
+        run: |
+          ORIGIN_SHA="$(git rev-parse origin/main)"
+          UPSTREAM_SHA="$(git rev-parse upstream/main)"
+
+          echo "origin_sha=$ORIGIN_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$ORIGIN_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            if [ "$FORCE_BUILD" = "true" ]; then
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor origin/main upstream/main; then
+            echo "mode=ff" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=force" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update origin/main fast-forward
+        if: steps.mode.outputs.mode == 'ff'
+        run: |
+          git push origin refs/remotes/upstream/main:refs/heads/main
+
+      - name: Update origin/main after upstream rewrite
+        if: steps.mode.outputs.mode == 'force'
+        run: |
+          git push --force-with-lease=main:${{ steps.mode.outputs.origin_sha }} \
+            origin refs/remotes/upstream/main:refs/heads/main
+
+      - name: Select build matrix
+        id: out
+        env:
+          CHANGED: ${{ steps.mode.outputs.changed }}
+          PLATFORM: ${{ github.event_name != 'workflow_dispatch' && 'all' || inputs.platform || 'all' }}
+          RELEASE_LATEST: ${{ github.event_name == 'schedule' && github.event.schedule == '0 0 * * *' }}
+          SHOULD_BUILD: ${{ steps.mode.outputs.should_build }}
+          TARGET_SHA: ${{ steps.mode.outputs.upstream_sha }}
+        run: |
+          case "$PLATFORM" in
+            all)
+              MATRIX='[{"platform":"t20","allow_failure":false},{"platform":"t21","allow_failure":false},{"platform":"t23","allow_failure":false},{"platform":"t30","allow_failure":false},{"platform":"t31","allow_failure":false},{"platform":"t32","allow_failure":true},{"platform":"t40","allow_failure":true},{"platform":"t41","allow_failure":false}]'
+              FULL_MATRIX=true
+              ;;
+            t20|t21|t23|t30|t31|t32|t40|t41)
+              allow_failure=false
+              case "$PLATFORM" in
+                t32|t40) allow_failure=true ;;
+              esac
+              MATRIX="[{\"platform\":\"$PLATFORM\",\"allow_failure\":$allow_failure}]"
+              FULL_MATRIX=false
+              ;;
+            *)
+              echo "Unsupported platform: $PLATFORM" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "full_matrix=$FULL_MATRIX" >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "release_latest=$RELEASE_LATEST" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.sync.outputs.matrix) }}
+
+    continue-on-error: ${{ matrix.allow_failure }}
+
+    steps:
+      - name: Checkout exact mirrored commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.target_sha }}
+          path: raptor
+          fetch-depth: 0
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf \
+            automake \
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            cmake \
+            cpio \
+            curl \
+            file \
+            flex \
+            gawk \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            libtool \
+            make \
+            meson \
+            ninja-build \
+            patch \
+            perl \
+            python3 \
+            rsync \
+            tar \
+            unzip \
+            wget
+
+      - name: Checkout Thingino firmware
+        run: |
+          git clone --depth 1 --branch "$THINGINO_REF" --recurse-submodules \
+            "$THINGINO_REPOSITORY" thingino
+
+      - name: Restore Buildroot download cache
+        uses: actions/cache@v4
+        with:
+          path: .buildroot-dl
+          key: thingino-buildroot-dl-${{ runner.os }}-${{ matrix.platform }}
+          restore-keys: |
+            thingino-buildroot-dl-${{ runner.os }}-
+
+      - name: Configure Thingino raptor package
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET_SHA: ${{ needs.sync.outputs.target_sha }}
+        run: |
+          set -eu
+          cd thingino
+
+          case "$PLATFORM" in
+            t20) soc_model=t20x; soc_family=t20; soc_arch=xburst1; sensor=jxf23; flash=16; uboot_board=isvp_t20_sfcnor_ddr128M ;;
+            t21) soc_model=t21n; soc_family=t21; soc_arch=xburst1; sensor=jxf37; flash=16; uboot_board=isvp_t21_sfcnor ;;
+            t23) soc_model=t23n; soc_family=t23; soc_arch=xburst1; sensor=sc2336; flash=16; uboot_board=isvp_t23n_sfcnor ;;
+            t30) soc_model=t30x; soc_family=t30; soc_arch=xburst1; sensor=sc4236; flash=16; uboot_board=isvp_t30_sfcnor_ddr128M ;;
+            t31) soc_model=t31x; soc_family=t31; soc_arch=xburst1; sensor=gc2053; flash=16; uboot_board=isvp_t31_sfcnor_ddr128M ;;
+            t32) soc_model=t31x; soc_family=t32; soc_arch=xburst1; sensor=sc4336; flash=16; uboot_board=isvp_t31_sfcnor_ddr128M ;;
+            t40) soc_model=t40xp; soc_family=t40; soc_arch=xburst2; sensor=gc4653; flash=128; uboot_board=isvp_t40xp_sfcnor ;;
+            t41) soc_model=t41nq; soc_family=t41; soc_arch=xburst2; sensor=gc4023; flash=16; uboot_board=isvp_t41nq_sfc_nor ;;
+            *) echo "Unsupported platform: $PLATFORM" >&2; exit 1 ;;
+          esac
+
+          camera="raptor_$PLATFORM"
+          mkdir -p "configs/cameras-ci/$camera" "user/$camera"
+
+          cat > "configs/cameras-ci/$camera/${camera}_defconfig" <<EOF
+          # NAME: Raptor CI $PLATFORM
+          # FRAG: soc-${soc_arch} ccache brand rootfs kernel system target uboot ssl
+          BR2_THINGINO_TOOLCHAIN_TYPE_EXTERNAL=y
+          BR2_THINGINO_TOOLCHAIN_GCC_15=y
+          BR2_THINGINO_TOOLCHAIN_LIBC_UCLIBC=y
+          BR2_INGENIC_SOC_MODEL="${soc_model}"
+          BR2_SOC_FAMILY="${soc_family}"
+          BR2_SOC_RAM_MB=128
+          BR2_ETHERNET=y
+          BR2_SENSOR_1_NAME="${sensor}"
+          BR2_THINGINO_AUDIO=y
+          BR2_PACKAGE_THINGINO_STREAMER_RAPTOR=y
+          BR2_PACKAGE_THINGINO_RAPTOR_FULL=y
+          BR2_PACKAGE_THINGINO_RAPTOR_AAC=y
+          BR2_PACKAGE_THINGINO_RAPTOR_OPUS=y
+          BR2_PACKAGE_THINGINO_RAPTOR_MP3=y
+          BR2_PACKAGE_THINGINO_RAPTOR_TLS=y
+          FLASH_SIZE_MB=${flash}
+          EOF
+
+          cat > "user/$camera/local.mk" <<EOF
+          THINGINO_RAPTOR_OVERRIDE_SRCDIR = $GITHUB_WORKSPACE/raptor
+          THINGINO_RAPTOR_VERSION = $TARGET_SHA
+          EOF
+
+          cp "user/$camera/local.mk" local.mk
+
+          if [ "$PLATFORM" = t32 ]; then
+            sed -i 's|$(@D)/$(SOC_FAMILY_CAPS)/lib/$(SDK_VERSION)/$(SDK_LIBC_NAME)/$(SDK_LIBC_VERSION)|$(INGENIC_LIB_SOC_LIB_DIR)|g' package/ingenic-lib/ingenic-lib.mk
+            sed -i '/^ACCEL_DIR =/i INGENIC_LIB_SOC_LIB_DIR = $(firstword $(wildcard $(@D)/$(SOC_FAMILY_CAPS)/lib/$(SDK_VERSION)/$(SDK_LIBC_NAME)/$(SDK_LIBC_VERSION)) $(wildcard $(@D)/$(SOC_FAMILY_CAPS)/lib/$(SDK_VERSION)/$(SDK_LIBC_NAME)))' package/ingenic-lib/ingenic-lib.mk
+          fi
+
+          {
+            echo "camera=$camera"
+            echo "soc_family=$soc_family"
+            echo "soc_model=$soc_model"
+            echo "soc_arch=$soc_arch"
+            echo "uboot_board=$uboot_board"
+          } >> "$GITHUB_ENV"
+
+      - name: Build raptor with Thingino Buildroot
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eu
+          cd thingino
+
+          soc_args="SOC_FAMILY=$soc_family SOC_MODEL=$soc_model SOC_ARCH=$soc_arch UBOOT_BOARDNAME=$uboot_board"
+          make GROUP=ci CAMERA="$camera" $soc_args show-vars WORKFLOW=1
+          make GROUP=ci CAMERA="$camera" $soc_args br-thingino-raptor WORKFLOW=1
+
+      - name: Build raptor with build.sh
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eu
+          cd thingino
+
+          soc_args="SOC_FAMILY=$soc_family SOC_MODEL=$soc_model SOC_ARCH=$soc_arch UBOOT_BOARDNAME=$uboot_board"
+          output_dir="$(make GROUP=ci CAMERA="$camera" $soc_args show-vars WORKFLOW=1 | sed -n 's/^OUTPUT_DIR = //p' | tail -1)"
+          build_dir="$output_dir/build"
+          staging_dir=""
+          for host_root in "$output_dir/host" "$output_dir/per-package/thingino-raptor/host"; do
+            for tuple in mipsel-buildroot-linux-uclibc mipsel-thingino-linux-uclibc mipsel-buildroot-linux-musl mipsel-thingino-linux-musl; do
+              if [ -d "$host_root/$tuple/sysroot" ]; then
+                staging_dir="$host_root/$tuple/sysroot"
+                break 2
+              fi
+            done
+          done
+          if [ -z "$staging_dir" ]; then
+            echo "Sysroot not found in $output_dir/host" >&2
+            exit 1
+          fi
+          toolchain_host="$output_dir/per-package/thingino-raptor/host"
+          if [ ! -d "$toolchain_host/bin" ]; then
+            toolchain_host="$(find "$output_dir/per-package" -path '*/host/bin' -type d | head -1)"
+            toolchain_host="${toolchain_host%/bin}"
+          fi
+          if [ ! -d "$toolchain_host/bin" ]; then
+            echo "Toolchain host not found under $output_dir" >&2
+            exit 1
+          fi
+          tuple="$(basename "$(dirname "$staging_dir")")"
+          mkdir -p "$output_dir/host/$tuple"
+          [ -e "$output_dir/host/bin" ] || ln -s "$toolchain_host/bin" "$output_dir/host/bin"
+          [ -e "$output_dir/host/$tuple/sysroot" ] || ln -s "$staging_dir" "$output_dir/host/$tuple/sysroot"
+
+          cd "$GITHUB_WORKSPACE"
+          rm -rf raptor-hal raptor-ipc raptor-common compy
+          cp -a "$(find "$build_dir" -maxdepth 1 -type d -name 'thingino-raptor-hal-*' | head -1)" raptor-hal
+          cp -a "$(find "$build_dir" -maxdepth 1 -type d -name 'thingino-raptor-ipc-*' | head -1)" raptor-ipc
+          cp -a "$(find "$build_dir" -maxdepth 1 -type d -name 'thingino-raptor-common-*' | head -1)" raptor-common
+
+          compy_build="$(find "$build_dir" -maxdepth 1 -type d -name 'compy-*' | head -1)"
+          mkdir -p compy/build-mips
+          cp -a "$compy_build/include" compy/
+          [ ! -d "$compy_build/_deps" ] || cp -a "$compy_build/_deps" compy/build-mips/
+          compy_lib=""
+          for candidate in "$staging_dir/usr/lib/libcompy.a" "$compy_build/libcompy.a"; do
+            if [ -f "$candidate" ]; then
+              compy_lib="$candidate"
+              break
+            fi
+          done
+          if [ -z "$compy_lib" ]; then
+            compy_lib="$(find "$output_dir" -type f -name libcompy.a | head -1)"
+          fi
+          if [ -z "$compy_lib" ]; then
+            echo "libcompy.a not found in $output_dir" >&2
+            exit 1
+          fi
+          cp -f "$compy_lib" compy/build-mips/libcompy.a
+
+          chmod +x raptor/build.sh
+          cd raptor
+          ./build.sh "$PLATFORM" "$output_dir"
+
+      - name: Package install tree
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET_SHA: ${{ needs.sync.outputs.target_sha }}
+        run: |
+          set -eu
+          cd thingino
+
+          soc_args="SOC_FAMILY=$soc_family SOC_MODEL=$soc_model SOC_ARCH=$soc_arch UBOOT_BOARDNAME=$uboot_board"
+          output_dir="$(make GROUP=ci CAMERA="$camera" $soc_args show-vars WORKFLOW=1 | sed -n 's/^OUTPUT_DIR = //p' | tail -1)"
+          staging_dir=""
+          for host_root in "$output_dir/host" "$output_dir/per-package/thingino-raptor/host"; do
+            for tuple in mipsel-buildroot-linux-uclibc mipsel-thingino-linux-uclibc mipsel-buildroot-linux-musl mipsel-thingino-linux-musl; do
+              if [ -d "$host_root/$tuple/sysroot" ]; then
+                staging_dir="$host_root/$tuple/sysroot"
+                break 2
+              fi
+            done
+          done
+          if [ -z "$staging_dir" ]; then
+            echo "Sysroot not found in $output_dir/host" >&2
+            exit 1
+          fi
+          short_sha="$(printf '%s' "$TARGET_SHA" | cut -c1-12)"
+          pkgdir="$RUNNER_TEMP/raptor-$PLATFORM"
+          platform_upper="$(printf '%s' "$PLATFORM" | tr '[:lower:]' '[:upper:]')"
+
+          rm -rf "$pkgdir" "$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$pkgdir/usr/bin" "$pkgdir/usr/lib" "$pkgdir/usr/share/raptor" "$GITHUB_WORKSPACE/artifacts"
+
+          cd "$GITHUB_WORKSPACE/raptor"
+          make PLATFORM="$platform_upper" DESTDIR="$pkgdir" install
+
+          test -x "$pkgdir/usr/bin/rvd"
+          test -x "$pkgdir/usr/bin/raptorctl"
+          test -x "$pkgdir/usr/bin/ringdump"
+
+          for lib in "$GITHUB_WORKSPACE"/raptor-common/librss_common.so \
+                     "$GITHUB_WORKSPACE"/raptor-ipc/librss_ipc.so \
+                     "$staging_dir"/usr/lib/librss_*.so \
+                     "$staging_dir"/usr/lib/lib*shim.so; do
+            [ -e "$lib" ] || continue
+            cp -f "$lib" "$pkgdir/usr/lib/"
+          done
+
+          {
+            echo "platform=$PLATFORM"
+            echo "upstream_sha=$TARGET_SHA"
+            echo "builder=thingino-buildroot"
+            echo "thingino_ref=$THINGINO_REF"
+            echo "libc=uclibc"
+            echo "built_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > "$pkgdir/usr/share/raptor/build-info"
+
+          tar -C "$pkgdir" -czf "$GITHUB_WORKSPACE/artifacts/raptor-$PLATFORM-$short_sha.tar.gz" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raptor-${{ matrix.platform }}
+          path: artifacts/raptor-${{ matrix.platform }}-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [sync, build]
+    if: needs.sync.outputs.should_build == 'true' && needs.sync.outputs.full_matrix == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: raptor-*
+          merge-multiple: true
+
+      - name: Verify target is still latest upstream commit
+        run: |
+          git init .
+          git remote add upstream https://github.com/gtxaspec/raptor.git
+          git fetch upstream main --depth=1
+          latest="$(git rev-parse FETCH_HEAD)"
+          target="${{ needs.sync.outputs.target_sha }}"
+          test "$latest" = "$target"
+
+      - name: Create or update per-commit release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ needs.sync.outputs.target_sha }}
+        run: |
+          tag="build-$SHA"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --prerelease
+            gh release upload "$tag" release-artifacts/* --clobber
+          else
+            gh release create "$tag" release-artifacts/* \
+              --prerelease \
+              --title "Build $SHA" \
+              --notes "Incremental build for upstream commit $SHA"
+          fi
+
+      - name: Update rolling nightly release
+        if: needs.sync.outputs.release_latest == 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ needs.sync.outputs.target_sha }}
+        run: |
+          tag="latest-main"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --yes
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag" >/dev/null 2>&1 || true
+          fi
+
+          gh release create "$tag" release-artifacts/* \
+            --latest \
+            --title "Latest main nightly" \
+            --notes "Nightly release for upstream commit $SHA"
